@@ -1,24 +1,25 @@
 /*
- * Copyright 2022 Oxide Computer Company
+ * Copyright 2024 Oxide Computer Company
  */
 
-use std::process::{Command, Stdio, exit};
-use anyhow::{Result, Context, bail, anyhow};
-use std::collections::HashMap;
+use anyhow::{anyhow, bail, Context, Result};
 use jmclib::log::prelude::*;
 use serde::Deserialize;
-use std::path::{PathBuf, Path};
-use uuid::Uuid;
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{exit, Command, Stdio};
+use uuid::Uuid;
 
-mod lofi;
 mod ensure;
-mod illumos;
 mod expand;
+mod features;
 mod fmri;
+mod illumos;
+mod lofi;
 
 use ensure::{Create, HashType};
-use expand::Expansion;
+use features::{Features, FeaturesParser};
 
 type Build = fn(ib: &mut ImageBuilder) -> Result<()>;
 
@@ -60,8 +61,9 @@ fn translate_gid(group: &str) -> Result<u32> {
 }
 
 fn main() -> Result<()> {
-    let cmd = std::env::args().nth(1)
-        .ok_or_else(||anyhow!("missing command name"))?;
+    let cmd = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow!("missing command name"))?;
 
     let mut opts = getopts::Options::new();
     opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
@@ -81,8 +83,13 @@ fn main() -> Result<()> {
             opts.reqopt("d", "dataset", "root dataset for work", "DATASET");
             opts.optopt("T", "templates", "directory for templates", "DIR");
             opts.optopt("S", "svccfg", "svccfg-native location", "SVCCFG");
-            opts.optmulti("F", "feature", "add or remove a feature definition",
-                "[^]FEATURE[=VALUE]");
+            opts.optmulti(
+                "F",
+                "feature",
+                "add or remove a feature definition",
+                "[^]FEATURE[[+|-]=VALUE]",
+            );
+            opts.optmulti("E", "external-src", "external file src tree", "DIR");
 
             run_build
         }
@@ -117,9 +124,8 @@ fn teardown_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P) -> Result<bool> {
     let imagefile = imagefile.as_ref();
 
     let lofis = lofi::lofi_list()?;
-    let matches: Vec<_> = lofis.iter()
-        .filter(|li| li.filename == imagefile)
-        .collect();
+    let matches: Vec<_> =
+        lofis.iter().filter(|li| li.filename == imagefile).collect();
     if !matches.is_empty() {
         if matches.len() != 1 {
             bail!("too many lofis");
@@ -128,7 +134,7 @@ fn teardown_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P) -> Result<bool> {
         let li = &matches[0];
 
         info!(log, "lofi exists {:?} -- removing...", li);
-        lofi::lofi_unmap_device(&li.devpath.as_ref().unwrap())?;
+        lofi::lofi_unmap_device(li.devpath.as_ref().unwrap())?;
         Ok(true)
     } else {
         info!(log, "no lofi found");
@@ -136,9 +142,11 @@ fn teardown_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P) -> Result<bool> {
     }
 }
 
-fn attach_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P, label: bool)
-    -> Result<lofi::LofiDevice>
-{
+fn attach_lofi<P: AsRef<Path>>(
+    log: &Logger,
+    imagefile: P,
+    label: bool,
+) -> Result<lofi::LofiDevice> {
     let lofi = lofi::lofi_map(&imagefile, label)?;
     info!(log, "lofi device = {}", lofi.devpath.as_ref().unwrap().display());
 
@@ -152,10 +160,12 @@ fn attach_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P, label: bool)
  * create a labelled lofi device (with partitions and slices), otherwise create
  * an unlabelled (simple) device.
  */
-fn recreate_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P, size: usize,
-    label: bool)
-    -> Result<lofi::LofiDevice>
-{
+fn recreate_lofi<P: AsRef<Path>>(
+    log: &Logger,
+    imagefile: P,
+    size: usize,
+    label: bool,
+) -> Result<lofi::LofiDevice> {
     let imagefile = imagefile.as_ref();
 
     /*
@@ -169,7 +179,7 @@ fn recreate_lofi<P: AsRef<Path>>(log: &Logger, imagefile: P, size: usize,
      * Create the file that we will use as the backing store for the pool.  The
      * size of this file is the resultant disk image size.
      */
-    mkfile(log, &imagefile, size)?;
+    mkfile(log, imagefile, size)?;
 
     /*
      * Attach this file as a lofi(7D) device.
@@ -196,40 +206,63 @@ struct ElToritoEntry {
  *
  * Both "start" and "nsectors" are specified as a count of 512 byte disk blocks.
  */
-fn fdisk_add<P: AsRef<Path>>(log: &Logger, rdev: P, id: u8, start: u32,
-    nsectors: u32) -> Result<()>
-{
+fn fdisk_add<P: AsRef<Path>>(
+    log: &Logger,
+    rdev: P,
+    id: u8,
+    start: u32,
+    nsectors: u32,
+) -> Result<()> {
     let rdev = rdev.as_ref();
 
-    ensure::run(log, &["/usr/sbin/fdisk",
-        "-A", &format!("{}:0:0:0:0:0:0:0:{}:{}", id, start, nsectors),
-        rdev.to_str().unwrap(),
-    ])?;
+    ensure::run(
+        log,
+        &[
+            "/usr/sbin/fdisk",
+            "-A",
+            &format!("{}:0:0:0:0:0:0:0:{}:{}", id, start, nsectors),
+            rdev.to_str().unwrap(),
+        ],
+    )?;
 
     Ok(())
 }
 
-fn installboot<P1, P2, P3>(log: &Logger, rdev: P1, stage1: P2, stage2: P3)
-    -> Result<()>
-    where P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>,
+fn installboot<P1, P2, P3>(
+    log: &Logger,
+    rdev: P1,
+    stage1: P2,
+    stage2: P3,
+) -> Result<()>
+where
+    P1: AsRef<Path>,
+    P2: AsRef<Path>,
+    P3: AsRef<Path>,
 {
     let rdev = rdev.as_ref();
     let stage1 = stage1.as_ref();
     let stage2 = stage2.as_ref();
 
-    ensure::run(log, &["/usr/sbin/installboot",
-        "-fm",
-        stage1.to_str().unwrap(),
-        stage2.to_str().unwrap(),
-        rdev.to_str().unwrap(),
-    ])?;
+    ensure::run(
+        log,
+        &[
+            "/usr/sbin/installboot",
+            "-fm",
+            stage1.to_str().unwrap(),
+            stage2.to_str().unwrap(),
+            rdev.to_str().unwrap(),
+        ],
+    )?;
 
     Ok(())
 }
 
-fn etdump<P: AsRef<Path>>(log: &Logger, imagefile: P, platform: &str,
-    system: &str) -> Result<ElToritoEntry>
-{
+fn etdump<P: AsRef<Path>>(
+    log: &Logger,
+    imagefile: P,
+    platform: &str,
+    system: &str,
+) -> Result<ElToritoEntry> {
     let imagefile = imagefile.as_ref();
 
     info!(log, "examining El Torito entries in {:?}", imagefile);
@@ -258,8 +291,8 @@ fn etdump<P: AsRef<Path>>(log: &Logger, imagefile: P, platform: &str,
             }
         }
 
-        if m.get("platform") == Some(&platform.to_string()) &&
-            m.get("system") == Some(&system.to_string())
+        if m.get("platform") == Some(&platform.to_string())
+            && m.get("system") == Some(&system.to_string())
         {
             let offset = if let Some(lba) = m.get("lba") {
                 lba.parse::<usize>()? * 2048
@@ -272,12 +305,15 @@ fn etdump<P: AsRef<Path>>(log: &Logger, imagefile: P, platform: &str,
                 bail!("missing sectors?");
             };
 
-            return Ok(ElToritoEntry { offset, length, });
+            return Ok(ElToritoEntry { offset, length });
         }
     }
 
-    bail!("could not find El Torito entry for (platform {} system {})",
-        platform, system);
+    bail!(
+        "could not find El Torito entry for (platform {} system {})",
+        platform,
+        system
+    );
 }
 
 fn run_build_iso(ib: &mut ImageBuilder) -> Result<()> {
@@ -317,10 +353,22 @@ fn run_build_iso(ib: &mut ImageBuilder) -> Result<()> {
     teardown_lofi(&ib.log, &imagefile)?;
     ensure::removed(&ib.log, &imagefile)?;
 
-    let mut args = vec!["/usr/bin/mkisofs", "-N", "-l", "-R", "-U", "-d",
-        "-D", "-c", ".catalog", "-allow-multidot", "-no-iso-translate",
-        "-cache-inodes"];
-    if let Some(volume_id) = iso.volume_id.as_deref() {
+    let mut args = vec![
+        "/usr/bin/mkisofs",
+        "-N",
+        "-l",
+        "-R",
+        "-U",
+        "-d",
+        "-D",
+        "-c",
+        ".catalog",
+        "-allow-multidot",
+        "-no-iso-translate",
+        "-cache-inodes",
+    ];
+    let volume_id = ib.expando(iso.volume_id.as_deref())?;
+    if let Some(volume_id) = volume_id.as_deref() {
         args.push("-V");
         args.push(volume_id);
     }
@@ -405,7 +453,7 @@ fn run_build_iso(ib: &mut ImageBuilder) -> Result<()> {
 
         let stage1 = format!("{}/{}", rmp.to_str().unwrap(), hybrid.stage1);
         let stage2 = format!("{}/{}", rmp.to_str().unwrap(), hybrid.stage2);
-        installboot(&ib.log, &p2, &stage1, &stage2)?;
+        installboot(&ib.log, p2, stage1, stage2)?;
 
         teardown_lofi(&ib.log, &imagefile)?;
     }
@@ -413,11 +461,15 @@ fn run_build_iso(ib: &mut ImageBuilder) -> Result<()> {
     /*
      * Copy the image file to the output directory.
      */
-    let outputfile = ib.output_file(&format!("{}-{}.iso", ib.group,
-        ib.output_name))?;
+    let outputfile =
+        ib.output_file(&format!("{}-{}.iso", ib.group, ib.output_name))?;
 
-    info!(ib.log, "copying image {} to output file {}",
-        imagefile.display(), outputfile.display());
+    info!(
+        ib.log,
+        "copying image {} to output file {}",
+        imagefile.display(),
+        outputfile.display()
+    );
     ensure::removed(&ib.log, &outputfile)?;
     std::fs::copy(&imagefile, &outputfile)?;
     ensure::perms(&ib.log, &outputfile, ROOT, ROOT, 0o644)?;
@@ -489,9 +541,21 @@ fn run_build_fs(ib: &mut ImageBuilder) -> Result<()> {
 
     let mntopts = match &fstyp {
         Fstyp::Ufs(ufs) => {
-            ensure::run(log, &["/usr/sbin/newfs", "-o", "space", "-m", "0",
-                "-i", &ufs.inode_density.to_string(), "-b", "4096",
-                ldev.to_str().unwrap()])?;
+            ensure::run(
+                log,
+                &[
+                    "/usr/sbin/newfs",
+                    "-o",
+                    "space",
+                    "-m",
+                    "0",
+                    "-i",
+                    &ufs.inode_density.to_string(),
+                    "-b",
+                    "4096",
+                    ldev.to_str().unwrap(),
+                ],
+            )?;
             "nologging,noatime"
         }
         Fstyp::Pcfs(pcfs) => {
@@ -500,17 +564,35 @@ fn run_build_fs(ib: &mut ImageBuilder) -> Result<()> {
              * target file system size in term of 512 byte sectors:
              */
             let secsize = size * 1024 * 1024 / 512;
-            ensure::run(log, &["/usr/sbin/mkfs", "-F", "pcfs", "-o",
-                &format!("b={},nofdisk,size={}", pcfs.label, secsize),
-                lrdev.to_str().unwrap()])?;
+            ensure::run(
+                log,
+                &[
+                    "/usr/sbin/mkfs",
+                    "-F",
+                    "pcfs",
+                    "-o",
+                    &format!("b={},nofdisk,size={}", pcfs.label, secsize),
+                    lrdev.to_str().unwrap(),
+                ],
+            )?;
             "noatime"
         }
     };
 
     ensure::directory(log, &rmp, ROOT, ROOT, 0o755)?;
 
-    ensure::run(log, &["/usr/sbin/mount", "-F", fsname, "-o", mntopts,
-        ldev.to_str().unwrap(), rmp.to_str().unwrap()])?;
+    ensure::run(
+        log,
+        &[
+            "/usr/sbin/mount",
+            "-F",
+            fsname,
+            "-o",
+            mntopts,
+            ldev.to_str().unwrap(),
+            rmp.to_str().unwrap(),
+        ],
+    )?;
 
     /*
      * Now that we have created the file system, run the steps for this
@@ -528,8 +610,10 @@ fn run_build_fs(ib: &mut ImageBuilder) -> Result<()> {
         /*
          * Only UFS has inodes.
          */
-        ensure::run(&ib.log, &["/usr/bin/df", "-o", "i",
-            rmp.to_str().unwrap()])?;
+        ensure::run(
+            &ib.log,
+            &["/usr/bin/df", "-o", "i", rmp.to_str().unwrap()],
+        )?;
     }
     ensure::run(&ib.log, &["/usr/bin/df", "-h", rmp.to_str().unwrap()])?;
 
@@ -542,11 +626,15 @@ fn run_build_fs(ib: &mut ImageBuilder) -> Result<()> {
     /*
      * Copy the image file to the output directory.
      */
-    let outputfile = ib.output_file(&format!("{}-{}.{}", ib.group,
-        ib.output_name, fsname))?;
+    let outputfile =
+        ib.output_file(&format!("{}-{}.{}", ib.group, ib.output_name, fsname))?;
 
-    info!(ib.log, "copying image {} to output file {}",
-        imagefile.display(), outputfile.display());
+    info!(
+        ib.log,
+        "copying image {} to output file {}",
+        imagefile.display(),
+        outputfile.display()
+    );
     ensure::removed(&ib.log, &outputfile)?;
     std::fs::copy(&imagefile, &outputfile)?;
     ensure::perms(&ib.log, &outputfile, ROOT, ROOT, 0o644)?;
@@ -598,8 +686,14 @@ fn run_build_pool(ib: &mut ImageBuilder) -> Result<()> {
     let lofi = recreate_lofi(log, &imagefile, pool.size(), true)?;
     let ldev = lofi.devpath.as_ref().unwrap();
 
-    let disk = ldev.to_str().unwrap().trim_end_matches("p0");
+    let disk = if pool.label() {
+        ldev.to_str().unwrap().trim_end_matches("p0")
+    } else {
+        ldev.to_str().unwrap()
+    };
     info!(log, "pool device = {}", disk);
+
+    let trimpool = pool.trim();
 
     /*
      * Create the new pool, using the temporary pool name while it is imported
@@ -610,13 +704,25 @@ fn run_build_pool(ib: &mut ImageBuilder) -> Result<()> {
      * correct both on this system and on the target system when it is
      * eventually imported as its target name.
      */
+    let compression = format!("compression={}", pool.compression());
     let mut args = vec![
-        "/sbin/zpool", "create",
-        "-d",
-        "-t", &temppool,
-        "-O", "compression=on",
-        "-R", altroot.to_str().unwrap(),
+        "/sbin/zpool",
+        "create",
+        "-t",
+        &temppool,
+        "-O",
+        &compression,
+        "-R",
+        altroot.to_str().unwrap(),
     ];
+
+    if pool.no_features() {
+        /*
+         * Create the pool without any enabled features.  This means it will be
+         * compatible with the widest variety of OS versions.
+         */
+        args.push("-d");
+    }
 
     if pool.uefi() {
         /*
@@ -630,6 +736,33 @@ fn run_build_pool(ib: &mut ImageBuilder) -> Result<()> {
     args.push("-o");
     let ashiftarg = format!("ashift={}", pool.ashift());
     args.push(&ashiftarg);
+
+    if pool.autoexpand() {
+        args.push("-o");
+        args.push("autoexpand=on");
+    }
+
+    let options = pool
+        .options
+        .iter()
+        .map(|x| ib.expand(x))
+        .collect::<Result<Vec<_>>>()?;
+
+    for o in &options {
+        args.push("-o");
+        args.push(o);
+    }
+
+    let fsoptions = pool
+        .fsoptions
+        .iter()
+        .map(|x| ib.expand(x))
+        .collect::<Result<Vec<_>>>()?;
+
+    for o in &fsoptions {
+        args.push("-O");
+        args.push(o);
+    }
 
     let targpool = ib.target_pool();
     args.push(&targpool);
@@ -645,50 +778,66 @@ fn run_build_pool(ib: &mut ImageBuilder) -> Result<()> {
     info!(ib.log, "steps complete; finalising image!");
 
     /*
+     * If requested, trim the pool to remove unnecessary bytes and make it more
+     * amenable to compression.
+     */
+    if trimpool {
+        zpool_trim(&ib.log, &temppool)?;
+    }
+
+    /*
      * Report the used and available space in the temporary pool before we
      * export it.
      */
-    info!(ib.log, "temporary pool has {} used, {} avail, {} compressratio",
+    info!(
+        ib.log,
+        "temporary pool has {} used, {} avail, {} compressratio",
         zfs_get(&temppool, "used")?,
         zfs_get(&temppool, "avail")?,
-        zfs_get(&temppool, "compressratio")?);
+        zfs_get(&temppool, "compressratio")?
+    );
 
     /*
      * Export the pool and detach the lofi device.
      */
     pool_export(&ib.log, &temppool)?;
 
-    if ib.template.pool.as_ref().unwrap().partition_only.unwrap_or(false) {
-        let outpartfile = ib.output_file(&format!("{}-{}.partonly", ib.group,
-            ib.output_name))?;
+    if ib.template.pool.as_ref().unwrap().partition_only() {
+        let outpartfile = ib.output_file(&format!(
+            "{}-{}.partonly",
+            ib.group, ib.output_name
+        ))?;
         ensure::removed(&ib.log, &outpartfile)?;
         info!(ib.log, "extract just the ZFS partition to {:?}", outpartfile);
 
         let uefi = ib.template.pool.as_ref().unwrap().uefi.unwrap_or(false);
-        let slice = if uefi {
-            "1"
-        } else {
-            "0"
-        };
+        let slice = if uefi { "1" } else { "0" };
 
-        ensure::run(&ib.log, &[
-            "dd",
-            &format!("if={}s{}", disk.replace("dsk", "rdsk"), slice),
-            &format!("of={}", outpartfile.to_str().unwrap()),
-            "bs=256k",
-        ])?;
+        ensure::run(
+            &ib.log,
+            &[
+                "dd",
+                &format!("if={}s{}", disk.replace("dsk", "rdsk"), slice),
+                &format!("of={}", outpartfile.to_str().unwrap()),
+                "bs=1k",
+            ],
+        )?;
     }
 
-    lofi::lofi_unmap_device(&ldev)?;
+    lofi::lofi_unmap_device(ldev)?;
 
     /*
      * Copy the image file to the output directory.
      */
-    let outputfile = ib.output_file(&format!("{}-{}.raw", ib.group,
-        ib.output_name))?;
+    let outputfile =
+        ib.output_file(&format!("{}-{}.raw", ib.group, ib.output_name))?;
 
-    info!(ib.log, "copying image {} to output file {}",
-        imagefile.display(), outputfile.display());
+    info!(
+        ib.log,
+        "copying image {} to output file {}",
+        imagefile.display(),
+        outputfile.display()
+    );
     ensure::removed(&ib.log, &outputfile)?;
     std::fs::copy(&imagefile, &outputfile)?;
     ensure::perms(&ib.log, &outputfile, ROOT, ROOT, 0o644)?;
@@ -734,50 +883,31 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
     let fullreset = mat.opt_present("x");
     let reset = mat.opt_present("r");
     let template_root = find_template_root(mat.opt_str("T"))?;
+    let external_src = mat
+        .opt_strs("E")
+        .iter()
+        .map(|e| {
+            let ee = PathBuf::from(e);
+            if !ee.is_dir() {
+                bail!("external file source {:?} should be a directory", e);
+            }
+            Ok(ee)
+        })
+        .collect::<Result<Vec<PathBuf>>>()?;
 
     /*
      * Process feature directives in the order in which they appear.  Directives
      * can override the value of previous definitions, and can remove a feature
      * already defined, to hopefully easily enable argument lists to be
      * constructed in control programs that override default values.
-     *
      */
-    let mut feature_directives = mat.opt_strs("F")
-        .iter()
-        .map(|o| {
-            let o = o.trim();
-
-            Ok(if o.is_empty() {
-                bail!("-f requires an argument");
-            } else if o.starts_with('^') {
-                /*
-                 * This is a negated feature; i.e., -F ^BLAH
-                 */
-                if o.contains('=') {
-                    bail!("-f with a negated feature cannot have a value");
-                }
-                (o.chars().skip(1).collect::<String>(), None)
-            } else if let Some((f, v)) = o.split_once('=') {
-                /*
-                 * This is an enabled feature with a value; i.e., -F BLAH=YES
-                 */
-                (f.trim().to_string(), Some(v.to_string()))
-            } else {
-                /*
-                 * This is an enabled feature with no value; i.e., -F BLAH
-                 * Just set it to "1", as if the user had passed: -F BLAH=1
-                 */
-                (o.to_string(), Some("1".to_string()))
-            })
-        }).collect::<Result<Vec<_>>>()?;
-    let mut features = HashMap::new();
-    for (f, v) in feature_directives.drain(..) {
-        if let Some(v) = v {
-            features.insert(f, v);
-        } else {
-            features.remove(&f);
+    let mut features = FeaturesParser::default();
+    for o in mat.opt_strs("F") {
+        if let Err(e) = features.specify(&o) {
+            bail!("invalid -F argument {o:?}: {e}");
         }
     }
+    let features = features.build();
 
     /*
      * Using the system svccfg(1M) is acceptable under some conditions, but not
@@ -793,11 +923,17 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
      * built illumos tree will be required.  Indeed, for a completely robust
      * image build process, that program should always be used.
      */
-    let svccfg = mat.opt_str("S")
-        .unwrap_or_else(|| "/usr/sbin/svccfg".to_string());
+    let svccfg =
+        mat.opt_str("S").unwrap_or_else(|| "/usr/sbin/svccfg".to_string());
 
-    let t = load_template(&template_root, &group, &name, false)
-        .context(format!("loading template {}:{}", group, name))?;
+    let t = load_template(
+        log,
+        &template_root,
+        &group,
+        Load::Main(group.to_string(), name.to_string()),
+        &features,
+    )
+    .context(format!("loading template {}:{}", group, name))?;
 
     if !dataset_exists(&ibrootds)? {
         bail!("image builder root dataset \"{}\" does not exist", ibrootds);
@@ -829,7 +965,8 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
      *
      * Ideally, this will go away with changes to illumos.
      */
-    let bename = Uuid::new_v4().to_hyphenated().to_string()[0..8].to_string();
+    let mut bename =
+        Uuid::new_v4().to_hyphenated().to_string()[0..8].to_string();
 
     let c = t.ufs.is_some() as u32
         + t.pcfs.is_some() as u32
@@ -837,8 +974,10 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
         + t.pool.is_some() as u32
         + t.dataset.is_some() as u32;
     if c > 1 {
-        bail!("template must have at most one of \"dataset\", \"ufs\", \
-            \"pool\", or \"iso\"");
+        bail!(
+            "template must have at most one of \"dataset\", \"ufs\", \
+            \"pool\", or \"iso\""
+        );
     }
 
     if t.dataset.is_none() {
@@ -867,6 +1006,9 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
         zfs_set(log, &workds, "sync", "disabled")?;
 
         let (build_type, func) = if let Some(pool) = &t.pool {
+            if let Some(n) = pool.bename() {
+                bename = n.to_string();
+            }
             (BuildType::Pool(pool.name().to_string()), run_build_pool as Build)
         } else if t.ufs.is_some() {
             (BuildType::Ufs, run_build_fs as Build)
@@ -891,6 +1033,7 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
             tmpds,
             svccfg,
             features,
+            external_src,
             log: log.clone(),
         };
 
@@ -909,7 +1052,7 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
     }
 
     let dataset = t.dataset.as_ref().unwrap();
-    let dataset_name = Expansion::parse(&dataset.name)?.evaluate(&features)?;
+    let dataset_name = features.expand(&dataset.name)?;
 
     let workds = format!("{}/work/{}/{}", ibrootds, group, dataset_name);
     info!(log, "work dataset: {}", workds);
@@ -927,6 +1070,7 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
         tmpds,
         svccfg,
         features,
+        external_src,
         log: log.clone(),
     };
 
@@ -947,8 +1091,11 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
             info!(log, "looking for output snapshot {}@{}", workds, snap);
             if snapshot_exists(&workds, snap)? && !reset {
                 snapshot_rollback(log, &workds, snap)?;
-                info!(log, "rolled back to output snapshot; \
-                    no work required");
+                info!(
+                    log,
+                    "rolled back to output snapshot; \
+                    no work required"
+                );
                 return Ok(());
             }
 
@@ -957,9 +1104,11 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
                  * If there is no input snapshot, we do not know how to make
                  * the dataset pristine for this build.  Bail out.
                  */
-                bail!("the dataset exists, but an input snapshot was not \
+                bail!(
+                    "the dataset exists, but an input snapshot was not \
                     specified and the output snapshot does not exist; \
-                    a full reset is required");
+                    a full reset is required"
+                );
             }
         }
 
@@ -973,15 +1122,19 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
                 snapshot_rollback(log, &workds, snap)?;
                 info!(log, "rolled back to input snapshot; work may begin");
             } else {
-                bail!("the dataset exists, but the specified input snapshot \
-                    does not; a full reset is required");
+                bail!(
+                    "the dataset exists, but the specified input snapshot \
+                    does not; a full reset is required"
+                );
             }
         } else {
             assert!(output_snapshot.is_none());
             assert!(input_snapshot.is_none());
 
-            bail!("the dataset exists, but neither an input nor an output \
-                snapshot was specified; a full reset is required");
+            bail!(
+                "the dataset exists, but neither an input nor an output \
+                snapshot was specified; a full reset is required"
+            );
         }
 
         assert!(input_snapshot.is_some());
@@ -1009,17 +1162,17 @@ fn run_build(log: &Logger, mat: &getopts::Matches) -> Result<()> {
 }
 
 fn gzip<P1, P2>(log: &Logger, src: P1, dst: P2) -> Result<()>
-    where P1: AsRef<Path>, P2: AsRef<Path>
+where
+    P1: AsRef<Path>,
+    P2: AsRef<Path>,
 {
     let src = src.as_ref();
     let dst = dst.as_ref();
 
     info!(log, "GZIP {:?} -> {:?}", src, dst);
 
-    let f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(dst)?;
+    let f =
+        std::fs::OpenOptions::new().create_new(true).write(true).open(dst)?;
 
     let cmd = Command::new("/usr/bin/gzip")
         .env_clear()
@@ -1060,6 +1213,72 @@ fn zpool_set(log: &Logger, pool: &str, n: &str, v: &str) -> Result<()> {
     Ok(())
 }
 
+fn zpool_trim(log: &Logger, pool: &str) -> Result<()> {
+    if pool.contains('/') {
+        bail!("no / allowed here");
+    }
+
+    info!(log, "TRIM POOL: {}", pool);
+
+    let cmd = Command::new("/sbin/zpool")
+        .env_clear()
+        .arg("trim")
+        .arg(pool)
+        .output()?;
+
+    if !cmd.status.success() {
+        let errmsg = String::from_utf8_lossy(&cmd.stderr);
+        /*
+         * This is not considered fatal, the pool's backing device may not
+         * support trim/discard.
+         */
+        info!(log, "zpool trim {} failed: {}", pool, errmsg);
+    } else {
+        /*
+         * Wait until the trim is complete. Unfortunately there is no nice
+         * parsable output mechanism for this information. When trimming is in
+         * progress, the output contains a line such as:
+         *   c6t5d0  ONLINE .. (2% trimmed, started at Mon May 15 ...)
+         * and when finished:
+         *   c6t5d0  ONLINE .. (100% trimmed, completed at Mon May 15 ...)
+         */
+        loop {
+            let output = Command::new("/sbin/zpool")
+                .env_clear()
+                .arg("status")
+                .arg("-t")
+                .arg(pool)
+                .output()?;
+
+            if !output.status.success() {
+                let errmsg = String::from_utf8_lossy(&output.stderr);
+                bail!("zpool trim status {} failed: {}", pool, errmsg);
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let status: Vec<&str> = stdout
+                .lines()
+                .filter(|x| x.contains("trimmed, started"))
+                .map(|x| {
+                    let s = x.find('(').unwrap_or(0);
+                    let e = x.rfind(')').unwrap_or(x.len());
+                    &x[s..e + 1]
+                })
+                .collect();
+
+            if status.len() != 1 {
+                break;
+            }
+
+            info!(log, "trim {}: {}", pool, status.first().unwrap());
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    Ok(())
+}
+
 fn zfs_set(log: &Logger, dataset: &str, n: &str, v: &str) -> Result<()> {
     info!(log, "SET DATASET PROPERTY ON {}: {} = {}", dataset, n, v);
 
@@ -1083,7 +1302,8 @@ fn zfs_get(dataset: &str, n: &str) -> Result<String> {
         .env_clear()
         .arg("get")
         .arg("-H")
-        .arg("-o").arg("value")
+        .arg("-o")
+        .arg("value")
         .arg(n)
         .arg(dataset)
         .output()?;
@@ -1105,7 +1325,8 @@ fn dataset_exists(dataset: &str) -> Result<bool> {
     let zfs = Command::new("/sbin/zfs")
         .env_clear()
         .arg("list")
-        .arg("-Ho").arg("name")
+        .arg("-Ho")
+        .arg("name")
         .arg(dataset)
         .output()?;
 
@@ -1156,7 +1377,7 @@ fn pool_destroy(log: &Logger, name: &str) -> Result<bool> {
         .env_clear()
         .arg("destroy")
         .arg("-f")
-        .arg(&name)
+        .arg(name)
         .output()?;
 
     if !cmd.status.success() {
@@ -1177,11 +1398,22 @@ fn pool_export(log: &Logger, name: &str) -> Result<bool> {
 
     info!(log, "EXPORT POOL: {}", name);
 
+    let cmd = Command::new("/sbin/zpool")
+        .env_clear()
+        .arg("sync")
+        .arg(name)
+        .output()?;
+
+    if !cmd.status.success() {
+        let errmsg = String::from_utf8_lossy(&cmd.stderr);
+        bail!("zpool sync failed: {}", errmsg);
+    }
+
     loop {
         let cmd = Command::new("/sbin/zpool")
             .env_clear()
             .arg("export")
-            .arg(&name)
+            .arg(name)
             .output()?;
 
         if cmd.status.success() {
@@ -1233,8 +1465,10 @@ fn snapshot_exists(dataset: &str, snapshot: &str) -> Result<bool> {
     let zfs = Command::new("/sbin/zfs")
         .env_clear()
         .arg("list")
-        .arg("-t").arg("snapshot")
-        .arg("-Ho").arg("name")
+        .arg("-t")
+        .arg("snapshot")
+        .arg("-Ho")
+        .arg("name")
         .arg(&n)
         .output()?;
 
@@ -1249,9 +1483,11 @@ fn snapshot_exists(dataset: &str, snapshot: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn snapshot_create(log: &Logger, dataset: &str, snapshot: &str)
-    -> Result<bool>
-{
+fn snapshot_create(
+    log: &Logger,
+    dataset: &str,
+    snapshot: &str,
+) -> Result<bool> {
     if dataset.contains('@') || snapshot.contains('@') {
         bail!("no @ allowed here");
     }
@@ -1273,9 +1509,11 @@ fn snapshot_create(log: &Logger, dataset: &str, snapshot: &str)
     Ok(true)
 }
 
-fn snapshot_rollback(log: &Logger, dataset: &str, snapshot: &str)
-    -> Result<bool>
-{
+fn snapshot_rollback(
+    log: &Logger,
+    dataset: &str,
+    snapshot: &str,
+) -> Result<bool> {
     if dataset.contains('@') || snapshot.contains('@') {
         bail!("no @ allowed here");
     }
@@ -1323,9 +1561,11 @@ fn dataset_create(log: &Logger, dataset: &str, parents: bool) -> Result<()> {
     Ok(())
 }
 
-fn mkfile<P: AsRef<Path>>(log: &Logger, filename: P, mblen: usize)
-    -> Result<()>
-{
+fn mkfile<P: AsRef<Path>>(
+    log: &Logger,
+    filename: P,
+    mblen: usize,
+) -> Result<()> {
     let filename = filename.as_ref();
     info!(log, "CREATE IMAGE ({}MB): {}", mblen, filename.display());
 
@@ -1352,65 +1592,108 @@ fn pkg(log: &Logger, args: &[&str]) -> Result<()> {
     ensure::run(log, &newargs)
 }
 
-fn pkg_install(log: &Logger, root: &str, packages: &[&str]) -> Result<()> {
+fn pkg_install(
+    log: &Logger,
+    root: &str,
+    packages: &[impl AsRef<str>],
+) -> Result<()> {
+    if packages.is_empty() {
+        info!(log, "skipping empty package list");
+        return Ok(());
+    }
+
     let mut newargs = vec!["/usr/bin/pkg", "-R", root, "install"];
     for pkg in packages {
-        newargs.push(pkg);
+        newargs.push(pkg.as_ref());
     }
 
     ensure::run(log, &newargs)
 }
 
-fn pkg_uninstall(log: &Logger, root: &str, packages: &[&str]) -> Result<()> {
+fn pkg_uninstall(
+    log: &Logger,
+    root: &str,
+    packages: &[impl AsRef<str>],
+) -> Result<()> {
+    if packages.is_empty() {
+        info!(log, "skipping empty package list");
+        return Ok(());
+    }
+
     let mut newargs = vec!["/usr/bin/pkg", "-R", root, "uninstall"];
     for pkg in packages {
-        newargs.push(pkg);
+        newargs.push(pkg.as_ref());
     }
 
     ensure::run(log, &newargs)
 }
 
-fn pkg_optional_deps(_log: &Logger, root: &str, package: &str,
-    strip_publisher: bool) -> Result<Vec<String>>
-{
+fn pkg_optional_deps(
+    _log: &Logger,
+    root: &str,
+    package: &str,
+    strip_publisher: bool,
+) -> Result<Vec<String>> {
     let cmd = Command::new("/usr/bin/pkg")
         .env_clear()
-        .arg("-R").arg(root)
+        .arg("-R")
+        .arg(root)
         .arg("contents")
-        .arg("-t").arg("depend")
-        .arg("-a").arg("type=optional")
+        .arg("-t")
+        .arg("depend")
+        .arg("-a")
+        .arg("type=optional")
         .arg("-H")
-        .arg("-o").arg("fmri")
+        .arg("-o")
+        .arg("fmri")
         .arg(package)
         .output()?;
 
     if !cmd.status.success() {
         let errmsg = String::from_utf8_lossy(&cmd.stderr);
-        bail!("pkg contents failed: {}", errmsg);
+
+        if errmsg.contains("no matching actions found") {
+            /*
+             * There is, at time of writing, apparently no way to distinguish
+             * between the case of no optional dependencies existing, as
+             * distinct from any other error (e.g., the package was not found).
+             * If we hit this specific message we'll return an empty set.
+             */
+            return Ok(Default::default());
+        }
+
+        bail!("pkg contents failed: {errmsg}");
     }
 
     let out = String::from_utf8(cmd.stdout)?;
     Ok(out
         .lines()
-        .map(|s| fmri::Package::parse_fmri(s))
+        .map(fmri::Package::parse_fmri)
         .collect::<Result<Vec<_>>>()?
         .iter()
-        .map(|p| if strip_publisher {
-            p.to_string_without_publisher()
-        } else {
-            p.to_string()
+        .map(|p| {
+            if strip_publisher {
+                p.to_string_without_publisher()
+            } else {
+                p.to_string()
+            }
         })
         .collect())
 }
 
-fn pkg_ensure_variant(log: &Logger, root: &str, variant: &str, value: &str)
-    -> Result<()>
-{
+fn pkg_ensure_variant(
+    log: &Logger,
+    root: &str,
+    variant: &str,
+    value: &str,
+) -> Result<()> {
     let cmd = Command::new("/usr/bin/pkg")
         .env_clear()
-        .arg("-R").arg(root)
+        .arg("-R")
+        .arg(root)
         .arg("variant")
-        .arg("-F").arg("json")
+        .arg("-F")
+        .arg("json")
         .output()?;
 
     if !cmd.status.success() {
@@ -1431,26 +1714,44 @@ fn pkg_ensure_variant(log: &Logger, root: &str, variant: &str, value: &str)
                 info!(log, "variant {} is already {}", variant, value);
                 return Ok(());
             } else {
-                info!(log, "variant {} is {}; changing to {}", variant,
-                    ent.value, value);
+                info!(
+                    log,
+                    "variant {} is {}; changing to {}",
+                    variant,
+                    ent.value,
+                    value
+                );
                 break;
             }
         }
     }
 
-    ensure::run(log, &["/usr/bin/pkg", "-R", root, "change-variant",
-        &format!("{}={}", variant, value)])?;
+    ensure::run(
+        log,
+        &[
+            "/usr/bin/pkg",
+            "-R",
+            root,
+            "change-variant",
+            &format!("{}={}", variant, value),
+        ],
+    )?;
     Ok(())
 }
 
-fn pkg_ensure_facet(log: &Logger, root: &str, facet: &str, value: &str)
-    -> Result<()>
-{
+fn pkg_ensure_facet(
+    log: &Logger,
+    root: &str,
+    facet: &str,
+    value: &str,
+) -> Result<()> {
     let cmd = Command::new("/usr/bin/pkg")
         .env_clear()
-        .arg("-R").arg(root)
+        .arg("-R")
+        .arg(root)
         .arg("facet")
-        .arg("-F").arg("json")
+        .arg("-F")
+        .arg("json")
         .output()?;
 
     if !cmd.status.success() {
@@ -1474,32 +1775,52 @@ fn pkg_ensure_facet(log: &Logger, root: &str, facet: &str, value: &str)
                 info!(log, "facet {} is already {}", facet, value);
                 return Ok(());
             } else {
-                info!(log, "facet {} is {}; changing to {}", facet,
-                    ent.value, value);
+                info!(
+                    log,
+                    "facet {} is {}; changing to {}", facet, ent.value, value
+                );
                 break;
             }
         }
     }
 
-    ensure::run(log, &["/usr/bin/pkg", "-R", root, "change-facet",
-        &format!("{}={}", facet, value)])?;
+    ensure::run(
+        log,
+        &[
+            "/usr/bin/pkg",
+            "-R",
+            root,
+            "change-facet",
+            &format!("{}={}", facet, value),
+        ],
+    )?;
     Ok(())
 }
 
-fn seed_smf(log: &Logger, svccfg: &str, tmpdir: &Path, mountpoint: &Path,
-    debug: bool, apply_site: bool) -> Result<()>
-{
+fn seed_smf(
+    log: &Logger,
+    svccfg: &str,
+    tmpdir: &Path,
+    mountpoint: &Path,
+    debug: bool,
+    apply_profiles: &[String],
+    seed: Option<&str>,
+) -> Result<()> {
     let tmpdir = tmpdir.to_str().unwrap();
     let mountpoint = mountpoint.to_str().unwrap();
 
-    let dtd = format!("{}/usr/share/lib/xml/dtd/service_bundle.dtd.1",
-        mountpoint);
+    let dtd =
+        format!("{}/usr/share/lib/xml/dtd/service_bundle.dtd.1", mountpoint);
     let repo = format!("{}/repo.db", tmpdir);
-    let seed = format!("{}/lib/svc/seed/{}.db", mountpoint, "global");
     let manifests = format!("{}/lib/svc/manifest", mountpoint);
     let installto = format!("{}/etc/svc/repository.db", mountpoint);
 
-    ensure::file(log, &seed, &repo, ROOT, ROOT, 0o600, Create::Always)?;
+    if let Some(p) = seed {
+        let seeddb = format!("{}/lib/svc/seed/{}.db", mountpoint, p);
+        ensure::file(log, seeddb, &repo, ROOT, ROOT, 0o600, Create::Always)?;
+    } else {
+        ensure::removed(log, &repo)?;
+    }
 
     let mut env = HashMap::new();
     env.insert("SVCCFG_DTD".to_string(), dtd);
@@ -1507,8 +1828,11 @@ fn seed_smf(log: &Logger, svccfg: &str, tmpdir: &Path, mountpoint: &Path,
     env.insert("SVCCFG_CHECKHASH".to_string(), "1".to_string());
     env.insert("PKG_INSTALL_ROOT".to_string(), mountpoint.to_string());
 
-    ensure::run_envs(log,
-        &[svccfg, "import", "-p", "/dev/stdout", &manifests], Some(&env))?;
+    ensure::run_envs(
+        log,
+        [svccfg, "import", "-p", "/dev/stdout", &manifests],
+        Some(&env),
+    )?;
 
     /*
      * If required, smf(5) can generate quite a lot of debug log output.  This
@@ -1525,10 +1849,29 @@ fn seed_smf(log: &Logger, svccfg: &str, tmpdir: &Path, mountpoint: &Path,
      * If requested enable debug logging for this image:
      */
     if debug {
-        ensure::run_envs(log, &[svccfg, "-s", "system/svc/restarter:default",
-            "addpg", "options", "application"], Some(&env))?;
-        ensure::run_envs(log, &[svccfg, "-s", "system/svc/restarter:default",
-            "setprop", "options/logging=debug"], Some(&env))?;
+        ensure::run_envs(
+            log,
+            [
+                svccfg,
+                "-s",
+                "system/svc/restarter:default",
+                "addpg",
+                "options",
+                "application",
+            ],
+            Some(&env),
+        )?;
+        ensure::run_envs(
+            log,
+            [
+                svccfg,
+                "-s",
+                "system/svc/restarter:default",
+                "setprop",
+                "options/logging=debug",
+            ],
+            Some(&env),
+        )?;
     }
 
     /*
@@ -1537,13 +1880,26 @@ fn seed_smf(log: &Logger, svccfg: &str, tmpdir: &Path, mountpoint: &Path,
      * may start up before the profile is applied in the booted system, only to
      * then be disabled again.
      */
-    if apply_site {
-        let profile_site = format!("{}/var/svc/profile/site.xml", mountpoint);
-        ensure::run_envs(log, &[svccfg, "apply", &profile_site], Some(&env))?;
+    for profile in apply_profiles {
+        let path = match profile.as_str() {
+            "generic" | "platform" => {
+                /*
+                 * According to /lib/svc/method/manifest-import the generic and
+                 * platform profiles are only supported in /etc.
+                 */
+                format!("{}/etc/svc/profile/{profile}.xml", mountpoint)
+            }
+            "site" => {
+                format!("{}/var/svc/profile/{profile}.xml", mountpoint)
+            }
+            other => {
+                bail!("unsupported profile name {other:?}");
+            }
+        };
+        ensure::run_envs(log, [svccfg, "apply", &path], Some(&env))?;
     }
 
-    ensure::file(log, &repo, &installto, ROOT, ROOT, 0o600,
-        Create::Always)?;
+    ensure::file(log, &repo, installto, ROOT, ROOT, 0o600, Create::Always)?;
     ensure::removed(log, &repo)?;
 
     Ok(())
@@ -1560,17 +1916,20 @@ impl ShadowFile {
         let mut data = String::new();
         f.read_to_string(&mut data)?;
 
-        let entries = data.lines().enumerate().map(|(i, l)| {
-            let fields = l.split(':').map(str::to_string).collect::<Vec<_>>();
-            if fields.len() != 9 {
-                bail!("invalid shadow line {}: {:?}", i, fields);
-            }
-            Ok(fields)
-        }).collect::<Result<Vec<_>>>()?;
+        let entries = data
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let fields =
+                    l.split(':').map(str::to_string).collect::<Vec<_>>();
+                if fields.len() != 9 {
+                    bail!("invalid shadow line {}: {:?}", i, fields);
+                }
+                Ok(fields)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(ShadowFile {
-            entries,
-        })
+        Ok(ShadowFile { entries })
     }
 
     pub fn password_set(&mut self, user: &str, password: &str) -> Result<()> {
@@ -1598,7 +1957,10 @@ impl ShadowFile {
             .write(true)
             .open(path.as_ref())?;
 
-        let mut data = self.entries.iter().map(|e| e.join(":"))
+        let mut data = self
+            .entries
+            .iter()
+            .map(|e| e.join(":"))
             .collect::<Vec<_>>()
             .join("\n");
         data.push('\n');
@@ -1639,7 +2001,8 @@ struct ImageBuilder {
 
     svccfg: String,
 
-    features: HashMap<String, String>,
+    features: Features,
+    external_src: Vec<PathBuf>,
 }
 
 impl ImageBuilder {
@@ -1716,6 +2079,25 @@ impl ImageBuilder {
         Ok(p)
     }
 
+    fn external_src_file(&self, filename: &str) -> Result<PathBuf> {
+        for dir in self.external_src.iter() {
+            let mut s = dir.clone();
+            s.push(filename);
+            if let Some(fi) = ensure::check(&s)? {
+                if !fi.is_file() {
+                    bail!(
+                        "template file {} is wrong type: {:?}",
+                        s.display(),
+                        fi.filetype
+                    );
+                }
+                return Ok(s);
+            }
+        }
+
+        bail!("could not find external source file \"{}\"", filename);
+    }
+
     fn template_file(&self, filename: &str) -> Result<PathBuf> {
         /*
          * First, try in the group-specific directory:
@@ -1724,8 +2106,11 @@ impl ImageBuilder {
         s.push(&format!("{}/files/{}", self.group, filename));
         if let Some(fi) = ensure::check(&s)? {
             if !fi.is_file() {
-                bail!("template file {} is wrong type: {:?}", s.display(),
-                    fi.filetype);
+                bail!(
+                    "template file {} is wrong type: {:?}",
+                    s.display(),
+                    fi.filetype
+                );
             }
             return Ok(s);
         }
@@ -1737,8 +2122,11 @@ impl ImageBuilder {
         s.push(&format!("files/{}", filename));
         if let Some(fi) = ensure::check(&s)? {
             if !fi.is_file() {
-                bail!("template file {} is wrong type: {:?}", s.display(),
-                    fi.filetype);
+                bail!(
+                    "template file {} is wrong type: {:?}",
+                    s.display(),
+                    fi.filetype
+                );
             }
             return Ok(s);
         }
@@ -1751,15 +2139,19 @@ impl ImageBuilder {
     }
 
     fn feature_enabled(&self, name: &str) -> bool {
-        self.features.contains_key(&name.to_string())
+        self.features.with(name)
     }
 
     fn expando(&self, value: Option<&str>) -> Result<Option<String>> {
-        value.map(|value| self.expand(value)).transpose()
+        self.features.expando(value)
     }
 
     fn expand(&self, value: &str) -> Result<String> {
-        Ok(Expansion::parse(value)?.evaluate(&self.features)?)
+        self.features.expand(value)
+    }
+
+    fn expandm(&self, values: &[String]) -> Result<Vec<String>> {
+        self.features.expandm(values)
     }
 }
 
@@ -1792,10 +2184,20 @@ struct Pcfs {
 #[derive(Deserialize, Debug, Clone)]
 struct Pool {
     name: String,
+    bename: Option<String>,
     ashift: Option<u8>,
     uefi: Option<bool>,
     size: usize,
     partition_only: Option<bool>,
+    no_features: Option<bool>,
+    compression: Option<String>,
+    label: Option<bool>,
+    autoexpand: Option<bool>,
+    trim: Option<bool>,
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    fsoptions: Vec<String>,
 }
 
 impl Pool {
@@ -1810,6 +2212,10 @@ impl Pool {
         self.uefi.unwrap_or(false)
     }
 
+    fn bename(&self) -> Option<&str> {
+        self.bename.as_deref()
+    }
+
     fn ashift(&self) -> u8 {
         /*
          * Default to 512 byte sectors.
@@ -1819,6 +2225,37 @@ impl Pool {
 
     fn size(&self) -> usize {
         self.size
+    }
+
+    fn partition_only(&self) -> bool {
+        if !self.label() {
+            /*
+             * There are no partitions if we do not use a labelled lofi device.
+             */
+            false
+        } else {
+            self.partition_only.unwrap_or(false)
+        }
+    }
+
+    fn no_features(&self) -> bool {
+        self.no_features.unwrap_or(true)
+    }
+
+    fn label(&self) -> bool {
+        self.label.unwrap_or(true)
+    }
+
+    fn compression(&self) -> &str {
+        self.compression.as_deref().unwrap_or("on")
+    }
+
+    fn autoexpand(&self) -> bool {
+        self.autoexpand.unwrap_or(false)
+    }
+
+    fn trim(&self) -> bool {
+        self.trim.unwrap_or(true)
     }
 }
 
@@ -1843,13 +2280,15 @@ struct Step {
 }
 
 trait StepExt<T>
-    where for<'de> T: Deserialize<'de>
+where
+    for<'de> T: Deserialize<'de>,
 {
     fn args(&self) -> Result<T>;
 }
 
 impl<T> StepExt<T> for Step
-    where for<'de> T: Deserialize<'de>
+where
+    for<'de> T: Deserialize<'de>,
 {
     fn args(&self) -> Result<T> {
         Ok(serde_json::from_value(self.extra.clone())?)
@@ -1866,9 +2305,11 @@ struct Template {
     steps: Vec<Step>,
 }
 
-fn include_path<P: AsRef<Path>>(root: P, group: &str, name: &str)
-    -> Result<PathBuf>
-{
+fn include_path<P: AsRef<Path>>(
+    root: P,
+    group: &str,
+    name: &str,
+) -> Result<PathBuf> {
     let paths = vec![
         format!("{}/include/{}.json", group, name),
         format!("include/{}.json", name),
@@ -1880,7 +2321,7 @@ fn include_path<P: AsRef<Path>>(root: P, group: &str, name: &str)
 
         if let Some(fi) = ensure::check(&fp)? {
             if fi.is_file() {
-                return Ok(fp)
+                return Ok(fp);
             }
         }
     }
@@ -1888,21 +2329,47 @@ fn include_path<P: AsRef<Path>>(root: P, group: &str, name: &str)
     bail!("could not find include file in: {:?}", paths);
 }
 
-fn load_template<P>(root: P, group: &str, name: &str, include: bool)
-    -> Result<Template>
-    where P: AsRef<Path>
+enum Load {
+    Main(String, String),
+    Include(String, String),
+    IncludeExplicit(PathBuf),
+}
+
+impl Load {
+    fn is_include(&self) -> bool {
+        match self {
+            Load::Include(_, _) | Load::IncludeExplicit(_) => true,
+            Load::Main(_, _) => false,
+        }
+    }
+}
+
+fn load_template<P>(
+    log: &Logger,
+    root: P,
+    group: &str,
+    load: Load,
+    features: &Features,
+) -> Result<Template>
+where
+    P: AsRef<Path>,
 {
-    let path = if include {
-        include_path(root.as_ref(), group, name)?
-    } else {
-        let mut path = root.as_ref().to_path_buf();
-        path.push(format!("{}/{}.json", group, name));
-        path
+    let path = match &load {
+        Load::Include(group, name) => include_path(root.as_ref(), group, name)?,
+        Load::Main(group, name) => {
+            let mut path = root.as_ref().to_path_buf();
+            path.push(format!("{}/{}.json", group, name));
+            path
+        }
+        Load::IncludeExplicit(path) => path.to_path_buf(),
     };
+
     let f = std::fs::File::open(&path)
         .with_context(|| anyhow!("template load path: {:?}", &path))?;
     let mut t: Template = serde_json::from_reader(f)?;
-    if include {
+
+    #[allow(clippy::collapsible_else_if)]
+    if load.is_include() {
         if t.pool.is_some() || t.dataset.is_some() {
             bail!("cannot specify \"pool\" or \"dataset\" in an include");
         }
@@ -1922,11 +2389,57 @@ fn load_template<P>(root: P, group: &str, name: &str, include: bool)
             #[derive(Deserialize)]
             struct IncludeArgs {
                 name: String,
+                file: Option<String>,
             }
 
             let a: IncludeArgs = step.args()?;
 
-            let ti = load_template(root.as_ref(), group, &a.name, true)?;
+            /*
+             * If this include is dependent on being with or without a
+             * particular feature, check for the present of that feature:
+             */
+            if let Some(feature) = step.with.as_deref() {
+                if !features.with(feature) {
+                    info!(
+                        log,
+                        "skip include {:?} because feature {:?} is \
+                        not enabled",
+                        a.name,
+                        feature
+                    );
+                    continue;
+                }
+            }
+            if let Some(feature) = step.without.as_deref() {
+                if features.with(feature) {
+                    info!(
+                        log,
+                        "skip include {:?} because feature {:?} is \
+                        enabled",
+                        a.name,
+                        feature
+                    );
+                    continue;
+                }
+            }
+
+            /*
+             * Expand any feature macros that appear in the explicit include
+             * file path if one was provided.  Care is taken to perform this
+             * expansion after any feature guarding ("with") above, in case the
+             * expansion would then use an undefined feature by mistake.
+             */
+            let file = features.expando(a.file.as_deref())?;
+            let load = if let Some(file) = file.as_deref() {
+                if !file.starts_with('/') {
+                    bail!("file must be fully qualified path");
+                }
+                Load::IncludeExplicit(PathBuf::from(file))
+            } else {
+                Load::Include(group.to_string(), a.name.to_string())
+            };
+
+            let ti = load_template(log, root.as_ref(), group, load, features)?;
             for step in ti.steps {
                 steps.push(step);
             }
@@ -1953,15 +2466,19 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
          */
         if let Some(feature) = step.with.as_deref() {
             if !ib.feature_enabled(feature) {
-                info!(log, "skip step because feature {:?} is not enabled",
-                    feature);
+                info!(
+                    log,
+                    "skip step because feature {:?} is not enabled", feature
+                );
                 continue;
             }
         }
         if let Some(feature) = step.without.as_deref() {
             if ib.feature_enabled(feature) {
-                info!(log, "skip step because feature {:?} is enabled",
-                    feature);
+                info!(
+                    log,
+                    "skip step because feature {:?} is enabled", feature
+                );
                 continue;
             }
         }
@@ -1989,8 +2506,16 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                  */
                 let targmp = ib.root()?;
                 ensure::directory(log, &targmp, ROOT, ROOT, 0o755)?;
-                ensure::run(log, &["/sbin/mount", "-F", "zfs", &beds,
-                    targmp.to_str().unwrap()])?;
+                ensure::run(
+                    log,
+                    &[
+                        "/sbin/mount",
+                        "-F",
+                        "zfs",
+                        &beds,
+                        targmp.to_str().unwrap(),
+                    ],
+                )?;
 
                 /*
                  * Set some BE properties...
@@ -2065,14 +2590,18 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                                 }
                                 continue;
                             } else {
-                                bail!("path {:?} cannot be matched?",
-                                    ent.path());
+                                bail!(
+                                    "path {:?} cannot be matched?",
+                                    ent.path()
+                                );
                             }
                         }
                     }
                     _ => {
-                        bail!("must specify exactly one of \"file\", \"dir\", \
-                            or \"pattern\"");
+                        bail!(
+                            "must specify exactly one of \"file\", \"dir\", \
+                            or \"pattern\""
+                        );
                     }
                 }
             }
@@ -2105,11 +2634,18 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 /*
                  * Unpack a tar file of an image created by another build:
                  */
+                let zflag = if name.ends_with("gz") { "z" } else { "" };
                 let tarf = ib.output_file(&name)?;
-                ensure::run(log,
-                    &["/usr/sbin/tar", "xzeEp@/f",
+                ensure::run(
+                    log,
+                    &[
+                        "/usr/sbin/tar",
+                        &format!("x{zflag}eEp@/f"),
                         tarf.to_str().unwrap(),
-                        "-C", &targdir])?;
+                        "-C",
+                        &targdir,
+                    ],
+                )?;
             }
             "pack_tar" => {
                 #[derive(Deserialize)]
@@ -2129,8 +2665,10 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let tarf = ib.output_file(&name)?;
                 ensure::removed(log, &tarf)?;
 
-                let mut args = vec!["/usr/sbin/tar", "czeEp@/f",
-                    tarf.to_str().unwrap()];
+                let zflag = if name.ends_with("gz") { "z" } else { "" };
+                let flags = format!("c{zflag}eEp@/f");
+                let mut args =
+                    vec!["/usr/sbin/tar", &flags, tarf.to_str().unwrap()];
                 if let Some(include) = &a.include {
                     include.iter().for_each(|s| {
                         args.push("-C");
@@ -2163,18 +2701,31 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                  * Upgrade to onu bits:
                  */
                 let publ = "on-nightly";
-                pkg(log, &["-R", targmp, "set-publisher",
-                    "--no-refresh",
-                    "--non-sticky",
-                    &publisher,
-                ])?;
-                pkg(log, &["-R", targmp, "set-publisher",
-                    "-e",
-                    "--no-refresh",
-                    "-P",
-                    "-O", &repo,
-                    publ,
-                ])?;
+                pkg(
+                    log,
+                    &[
+                        "-R",
+                        targmp,
+                        "set-publisher",
+                        "--no-refresh",
+                        "--non-sticky",
+                        &publisher,
+                    ],
+                )?;
+                pkg(
+                    log,
+                    &[
+                        "-R",
+                        targmp,
+                        "set-publisher",
+                        "-e",
+                        "--no-refresh",
+                        "-P",
+                        "-O",
+                        &repo,
+                        publ,
+                    ],
+                )?;
                 pkg(log, &["-R", targmp, "refresh", "--full"])?;
                 if !a.uninstall.is_empty() {
                     let mut args = vec!["-R", targmp, "uninstall"];
@@ -2183,9 +2734,10 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     }
                     pkg(log, &args)?;
                 }
-                pkg(log, &["-R", targmp, "change-facet",
-                    "onu.ooceonly=false"
-                ])?;
+                pkg(
+                    log,
+                    &["-R", targmp, "change-facet", "onu.ooceonly=false"],
+                )?;
                 pkg(log, &["-R", targmp, "update"])?;
                 pkg(log, &["-R", targmp, "purge-history"])?;
             }
@@ -2246,7 +2798,7 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
 
                 let mut outstr = String::new();
                 for f in files.iter() {
-                    let inf = std::fs::read_to_string(&f)?;
+                    let inf = std::fs::read_to_string(f)?;
                     let out = inf.trim();
                     if out.is_empty() {
                         continue;
@@ -2257,8 +2809,15 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     }
                 }
 
-                ensure::filestr(log, &outstr, &outfile, ROOT, ROOT, 0o644,
-                    Create::Always)?;
+                ensure::filestr(
+                    log,
+                    &outstr,
+                    &outfile,
+                    ROOT,
+                    ROOT,
+                    0o644,
+                    Create::Always,
+                )?;
             }
             "shadow" => {
                 #[derive(Deserialize)]
@@ -2307,18 +2866,20 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let a: DigestArgs = step.args()?;
                 let owner = translate_uid(&a.owner)?;
                 let group = translate_gid(&a.group)?;
+                let target = ib.expand(&a.target)?;
+                let src = ib.expand(&a.src)?;
 
-                if !a.target.starts_with('/') {
+                if !target.starts_with('/') {
                     bail!("target must be fully qualified path");
                 }
-                let target = format!("{}{}", targmp, a.target);
+                let target = format!("{}{}", targmp, target);
 
                 let mode = u32::from_str_radix(&a.mode, 8)?;
 
-                if a.src.starts_with('/') {
+                if src.starts_with('/') {
                     bail!("source file must be a relative path");
                 }
-                let src = ib.output_file(&a.src)?;
+                let src = ib.output_file(&src)?;
 
                 gzip(log, &src, &target)?;
                 ensure::perms(log, &target, owner, group, mode)?;
@@ -2340,6 +2901,8 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let a: DigestArgs = step.args()?;
                 let owner = translate_uid(&a.owner)?;
                 let group = translate_gid(&a.group)?;
+                let target = ib.expand(&a.target)?;
+                let src = ib.expand(&a.src)?;
 
                 let ht = match a.algorithm.as_str() {
                     "sha1" => HashType::SHA1,
@@ -2347,23 +2910,30 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     x => bail!("unknown digest algorithm {}", x),
                 };
 
-                if !a.target.starts_with('/') {
+                if !target.starts_with('/') {
                     bail!("target must be fully qualified path");
                 }
-                let target = format!("{}{}", targmp, a.target);
+                let target = format!("{}{}", targmp, target);
 
                 let mode = u32::from_str_radix(&a.mode, 8)?;
 
-                if a.src.starts_with('/') {
+                if src.starts_with('/') {
                     bail!("source file must be a relative path");
                 }
-                let src = ib.output_file(&a.src)?;
+                let src = ib.output_file(&src)?;
 
                 let mut hash = ensure::hash_file(&src, &ht)?;
                 hash += "\n";
 
-                ensure::filestr(log, &hash, &target, owner, group, mode,
-                    Create::Always)?;
+                ensure::filestr(
+                    log,
+                    &hash,
+                    &target,
+                    owner,
+                    group,
+                    mode,
+                    Create::Always,
+                )?;
             }
             "ensure_symlink" => {
                 let mp = ib.root()?;
@@ -2448,6 +3018,7 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     imagesrc: Option<String>,
                     tarsrc: Option<String>,
                     outputsrc: Option<String>,
+                    extsrc: Option<String>,
                     contents: Option<String>,
                     file: String,
                     owner: String,
@@ -2458,15 +3029,21 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let a: FileArgs = step.args()?;
                 let owner = translate_uid(&a.owner)?;
                 let group = translate_gid(&a.group)?;
+                let src = ib.expando(a.src.as_deref())?;
+                let imagesrc = ib.expando(a.imagesrc.as_deref())?;
+                let tarsrc = ib.expando(a.tarsrc.as_deref())?;
+                let outputsrc = ib.expando(a.outputsrc.as_deref())?;
+                let extsrc = ib.expando(a.extsrc.as_deref())?;
+                let file = ib.expand(&a.file)?;
 
-                if !a.file.starts_with('/') {
+                if !file.starts_with('/') {
                     bail!("file must be fully qualified path");
                 }
-                let file = format!("{}{}", targmp, a.file);
+                let file = format!("{}{}", targmp, file);
 
                 let mode = u32::from_str_radix(&a.mode, 8)?;
 
-                if let Some(src) = &a.src {
+                if let Some(src) = &src {
                     /*
                      * "src" specifies a source file from within the template
                      * directory structure, whether at the top level or at the
@@ -2476,9 +3053,35 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                         bail!("source file must be a relative path");
                     }
                     let src = ib.template_file(src)?;
-                    ensure::file(log, &src, &file, owner, group,
-                        mode, Create::Always)?;
-                } else if let Some(outputsrc) = &a.outputsrc {
+                    ensure::file(
+                        log,
+                        &src,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
+                } else if let Some(extsrc) = &extsrc {
+                    /*
+                     * "extsrc" specifies a source file that comes from one or
+                     * more proto area-like trees of files passed in via the -E
+                     * option.
+                     */
+                    if extsrc.starts_with('/') {
+                        bail!("external source file must be a relative path");
+                    }
+                    let src = ib.external_src_file(extsrc)?;
+                    ensure::file(
+                        log,
+                        &src,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
+                } else if let Some(outputsrc) = &outputsrc {
                     /*
                      * "outputsrc" specifies a source file from within the
                      * output area.  Useful for including the output of a
@@ -2489,9 +3092,16 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                         bail!("output source file must be a relative path");
                     }
                     let src = ib.output_file(outputsrc)?;
-                    ensure::file(log, &src, &file, owner, group,
-                        mode, Create::Always)?;
-                } else if let Some(imagesrc) = &a.imagesrc {
+                    ensure::file(
+                        log,
+                        &src,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
+                } else if let Some(imagesrc) = &imagesrc {
                     /*
                      * "imagesrc" specifies a source file that already exists
                      * within the image.  Can be used to make a copy of an
@@ -2501,9 +3111,16 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                         bail!("image source file must be fully qualified");
                     }
                     let src = format!("{}{}", targmp, imagesrc);
-                    ensure::file(log, &src, &file, owner, group,
-                        mode, Create::Always)?;
-                } else if let Some(tarsrc) = &a.tarsrc {
+                    ensure::file(
+                        log,
+                        &src,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
+                } else if let Some(tarsrc) = &tarsrc {
                     /*
                      * "tarsrc" specifies a file in the temporary directory
                      * created by the last "unpack_tar" action that used
@@ -2516,15 +3133,29 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     }
                     let tardir = ib.tmp_file("unpack_tar")?;
                     let src = format!("{}{}", tardir.to_str().unwrap(), tarsrc);
-                    ensure::file(log, &src, &file, owner, group,
-                        mode, Create::Always)?;
+                    ensure::file(
+                        log,
+                        &src,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
                 } else if let Some(contents) = &a.contents {
                     /*
                      * "contents" provides a literal string in the template to
                      * construct the target file.
                      */
-                    ensure::filestr(log, contents, &file, owner, group,
-                        mode, Create::Always)?;
+                    ensure::filestr(
+                        log,
+                        contents,
+                        &file,
+                        owner,
+                        group,
+                        mode,
+                        Create::Always,
+                    )?;
                 } else {
                     bail!("must specify either \"src\" or \"contents\"");
                 }
@@ -2538,23 +3169,50 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 zpool_set(log, &ib.temp_pool(), "bootfs", &beds)?;
 
                 ensure::run(log, &["/sbin/beadm", "activate", ib.bename()])?;
-                ensure::run(log, &["/sbin/bootadm", "install-bootloader",
-                    "-M", "-f", "-P", &ib.temp_pool(), "-R", targmp])?;
-                ensure::run(log, &["/sbin/bootadm", "update-archive",
-                    "-f", "-R", targmp])?;
+                ensure::run(
+                    log,
+                    &[
+                        "/sbin/bootadm",
+                        "install-bootloader",
+                        "-M",
+                        "-f",
+                        "-P",
+                        &ib.temp_pool(),
+                        "-R",
+                        targmp,
+                    ],
+                )?;
+                ensure::run(
+                    log,
+                    &["/sbin/bootadm", "update-archive", "-f", "-R", targmp],
+                )?;
             }
             "pkg_image_create" => {
                 #[derive(Deserialize)]
                 struct PkgImageCreateArgs {
-                    publisher: String,
-                    uri: String,
+                    publisher: Option<String>,
+                    uri: Option<String>,
                 }
 
                 let a: PkgImageCreateArgs = step.args()?;
+                let publisher = ib.expando(a.publisher.as_deref())?;
+                let uri = ib.expando(a.uri.as_deref())?;
                 let mp = ib.root()?;
-                pkg(log, &["image-create", "--full",
-                    "--publisher", &format!("{}={}", a.publisher, a.uri),
-                    mp.to_str().unwrap()])?;
+
+                if publisher.is_some() != uri.is_some() {
+                    bail!("publisher and uri must be specified together");
+                }
+
+                let mut args = vec!["image-create", "--full"];
+                let pubarg;
+                if publisher.is_some() {
+                    pubarg = format!("{}={}", publisher.unwrap(), uri.unwrap());
+                    args.push("--publisher");
+                    args.push(&pubarg);
+                }
+                args.push(mp.to_str().unwrap());
+
+                pkg(log, &args)?;
             }
             "pkg_install" => {
                 #[derive(Deserialize)]
@@ -2568,8 +3226,9 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let a: PkgInstallArgs = step.args()?;
                 let mp = ib.root()?;
 
-                let pkgs: Vec<_> = a.pkgs.iter().map(|s| s.as_str()).collect();
-                pkg_install(log, mp.to_str().unwrap(), pkgs.as_slice())?;
+                let pkgs_expanded = ib.expandm(&a.pkgs)?;
+
+                pkg_install(log, mp.to_str().unwrap(), &pkgs_expanded)?;
 
                 if a.include_optional {
                     let mut pkgs = Vec::new();
@@ -2578,8 +3237,8 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                      * By default it seems that IPS ignores the publisher in an
                      * FMRI for a require dependency, and we should also.
                      */
-                    let strip_publishers = a.strip_optional_publishers
-                        .unwrap_or(true);
+                    let strip_publishers =
+                        a.strip_optional_publishers.unwrap_or(true);
 
                     /*
                      * For each package, expand any optional dependencies and
@@ -2589,11 +3248,13 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                      * "opensolaris.zone" variant here; for now we assume we are
                      * in the global zone and all packages are OK.
                      */
-                    for pkg in a.pkgs.iter() {
-                        let opts = pkg_optional_deps(log,
+                    for pkg in pkgs_expanded {
+                        let opts = pkg_optional_deps(
+                            log,
                             mp.to_str().unwrap(),
                             pkg.as_str(),
-                            strip_publishers)?;
+                            strip_publishers,
+                        )?;
 
                         for opt in opts {
                             if pkgs.contains(&opt) {
@@ -2606,11 +3267,13 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     }
 
                     if !pkgs.is_empty() {
-                        let pkgs: Vec<_> = pkgs.iter().map(|s| s.as_str())
-                            .collect();
-                        pkg_install(log,
+                        let pkgs: Vec<_> =
+                            pkgs.iter().map(|s| s.as_str()).collect();
+                        pkg_install(
+                            log,
                             mp.to_str().unwrap(),
-                            pkgs.as_slice())?;
+                            pkgs.as_slice(),
+                        )?;
                     }
                 }
             }
@@ -2624,10 +3287,16 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 let a: PkgSetPropertyArgs = step.args()?;
                 let mp = ib.root()?;
 
-                pkg(log, &["-R", mp.to_str().unwrap(), "set-property",
-                    &a.name,
-                    &a.value,
-                ])?;
+                pkg(
+                    log,
+                    &[
+                        "-R",
+                        mp.to_str().unwrap(),
+                        "set-property",
+                        &a.name,
+                        &a.value,
+                    ],
+                )?;
             }
             "pkg_set_publisher" => {
                 #[derive(Deserialize)]
@@ -2635,17 +3304,27 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     publisher: String,
                     uri: Option<String>,
                     sticky: Option<bool>,
+                    mirror_uri: Option<String>,
                 }
 
                 let a: PkgSetPublisherArgs = step.args()?;
                 let mp = ib.root()?;
+                let publisher = ib.expand(&a.publisher)?;
+                let uri = ib.expando(a.uri.as_deref())?;
+                let mirror_uri = ib.expando(a.mirror_uri.as_deref())?;
+
+                if uri.is_none() && mirror_uri.is_none() {
+                    bail!("specify at least one of \"uri\" and \"mirror_uri\"");
+                }
 
                 let mut args = vec![
-                    "-R", &mp.to_str().unwrap(), "set-publisher",
+                    "-R",
+                    mp.to_str().unwrap(),
+                    "set-publisher",
                     "--no-refresh",
                 ];
 
-                if let Some(ref uri) = a.uri {
+                if let Some(uri) = uri.as_deref() {
                     args.push("-O");
                     args.push(uri);
                 }
@@ -2657,7 +3336,20 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                     }
                 }
 
-                args.push(&a.publisher);
+                if let Some(mirror_uri) = mirror_uri.as_deref() {
+                    /*
+                     * We want to set the mirror URI, but there is only an
+                     * option to add another mirror.  Before we add our mirror,
+                     * remove all existing mirrors if there are any:
+                     */
+                    args.push("-M");
+                    args.push("*");
+
+                    args.push("-m");
+                    args.push(mirror_uri);
+                }
+
+                args.push(&publisher);
 
                 pkg(log, &args)?;
             }
@@ -2710,13 +3402,22 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 if a.certfile.starts_with('/') {
                     bail!("certificate file must be a relative path");
                 }
-                let cacert = ib.template_file(&a.certfile)?
-                    .to_str().unwrap().to_string();
+                let cacert = ib
+                    .template_file(&a.certfile)?
+                    .to_str()
+                    .unwrap()
+                    .to_string();
 
-                pkg(log, &["-R", mp.to_str().unwrap(), "set-publisher",
-                    &format!("--approve-ca-cert={}", &cacert),
-                    &a.publisher,
-                ])?;
+                pkg(
+                    log,
+                    &[
+                        "-R",
+                        mp.to_str().unwrap(),
+                        "set-publisher",
+                        &format!("--approve-ca-cert={}", &cacert),
+                        &a.publisher,
+                    ],
+                )?;
             }
             "pkg_uninstall" => {
                 #[derive(Deserialize)]
@@ -2726,8 +3427,10 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
 
                 let a: PkgUninstallArgs = step.args()?;
                 let mp = ib.root()?;
-                let pkgs: Vec<_> = a.pkgs.iter().map(|s| s.as_str()).collect();
-                pkg_uninstall(log, mp.to_str().unwrap(), pkgs.as_slice())?;
+
+                let pkgs_expanded = ib.expandm(&a.pkgs)?;
+
+                pkg_uninstall(log, mp.to_str().unwrap(), &pkgs_expanded)?;
             }
             "pkg_change_variant" => {
                 #[derive(Deserialize)]
@@ -2738,8 +3441,12 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
 
                 let a: PkgChangeVariantArgs = step.args()?;
                 let mp = ib.root()?;
-                pkg_ensure_variant(log, mp.to_str().unwrap(),
-                    &a.variant, &a.value)?;
+                pkg_ensure_variant(
+                    log,
+                    mp.to_str().unwrap(),
+                    &a.variant,
+                    &a.value,
+                )?;
             }
             "pkg_change_facet" => {
                 #[derive(Deserialize)]
@@ -2750,8 +3457,12 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
 
                 let a: PkgChangeFacetArgs = step.args()?;
                 let mp = ib.root()?;
-                pkg_ensure_facet(log, mp.to_str().unwrap(),
-                    &a.facet, &a.value)?;
+                pkg_ensure_facet(
+                    log,
+                    mp.to_str().unwrap(),
+                    &a.facet,
+                    &a.value,
+                )?;
             }
             "pkg_purge_history" => {
                 let mp = ib.root()?;
@@ -2762,14 +3473,69 @@ fn run_steps(ib: &mut ImageBuilder) -> Result<()> {
                 struct SeedSmfArgs {
                     debug: Option<bool>,
                     apply_site: Option<bool>,
+                    #[serde(default)]
+                    apply_profiles: Vec<String>,
+                    seed: Option<String>,
+                    skip_seed: Option<bool>,
                 }
 
                 let a: SeedSmfArgs = step.args()?;
                 let debug = a.debug.unwrap_or(false);
                 let apply_site = a.apply_site.unwrap_or(false);
+                let apply_profiles = a
+                    .apply_profiles
+                    .iter()
+                    .map(|p| ib.expand(p.as_str()))
+                    .collect::<Result<Vec<_>>>()?;
+                let seed = match a.skip_seed.unwrap_or(false) {
+                    true => None,
+                    false => Some(a.seed.as_deref().unwrap_or("global")),
+                };
 
-                seed_smf(log, &ib.svccfg, &ib.tmpdir()?, &ib.root()?, debug,
-                    apply_site)?;
+                /*
+                 * Drop any empty strings in the profile list.  This allows
+                 * consumers to use macro expansion to make a particular profile
+                 * optional, by having a macro that expands to nothing under
+                 * some conditions.
+                 */
+                let apply_profiles = apply_profiles
+                    .into_iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .collect::<Vec<_>>();
+
+                let apply_profiles = if apply_site {
+                    if !apply_profiles.is_empty() {
+                        bail!(
+                            "apply_site and apply_profiles are mutually \
+                            exclusive"
+                        );
+                    }
+
+                    vec!["site".to_string()]
+                } else {
+                    apply_profiles
+                };
+
+                /*
+                 * For now, we only support the "generic", "platform", and
+                 * "site" profiles:
+                 */
+                for profile in apply_profiles.iter() {
+                    match profile.as_str() {
+                        "generic" | "platform" | "site" => (),
+                        other => bail!("unsupported profile: {other:?}"),
+                    }
+                }
+
+                seed_smf(
+                    log,
+                    &ib.svccfg,
+                    &ib.tmpdir()?,
+                    &ib.root()?,
+                    debug,
+                    &apply_profiles,
+                    seed,
+                )?;
             }
             x => {
                 bail!("INVALID STEP TYPE: {}", x);

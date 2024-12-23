@@ -1,11 +1,12 @@
 /*
- * Copyright 2021 Oxide Computer Company
+ * Copyright 2023 Oxide Computer Company
  */
 
+use anyhow::{bail, Context, Result};
+use libdevinfo_sys::{di_devlink_fini, di_devlink_init, DI_MAKE_LINK};
 use std::ffi::{CStr, CString};
-use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
-use anyhow::{Result, Context, bail};
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 fn errno() -> i32 {
@@ -112,10 +113,11 @@ impl LofiDevice {
                 )
             }
         } else {
-            let mut rdevpath = unsafe { CStr::from_ptr(li.li_devpath.as_ptr()) }
-                .to_str()
-                .unwrap()
-                .to_string();
+            let mut rdevpath =
+                unsafe { CStr::from_ptr(li.li_devpath.as_ptr()) }
+                    .to_str()
+                    .unwrap()
+                    .to_string();
 
             if labeled {
                 rdevpath.push_str("p0");
@@ -128,9 +130,11 @@ impl LofiDevice {
         let devpath = devpath.map(PathBuf::from);
         let rdevpath = rdevpath.map(PathBuf::from);
 
-        let filename = PathBuf::from(unsafe {
-            CStr::from_ptr(li.li_filename.as_ptr())
-        }.to_str().unwrap());
+        let filename = PathBuf::from(
+            unsafe { CStr::from_ptr(li.li_filename.as_ptr()) }
+                .to_str()
+                .unwrap(),
+        );
 
         LofiDevice {
             id: li.li_id,
@@ -171,11 +175,8 @@ impl LofiFd {
     }
 
     fn open(readonly: bool) -> Result<LofiFd> {
-        let flag = libc::O_EXCL | if readonly {
-            libc::O_RDONLY
-        } else {
-            libc::O_RDWR
-        };
+        let flag =
+            libc::O_EXCL | if readonly { libc::O_RDONLY } else { libc::O_RDWR };
 
         let path = std::ffi::CString::new(b"/dev/lofictl".to_vec())?;
 
@@ -226,9 +227,7 @@ pub fn lofi_list() -> Result<Vec<LofiDevice>> {
     Ok(out)
 }
 
-pub fn lofi_map<P: AsRef<Path>>(file: P, label: bool)
-    -> Result<LofiDevice>
-{
+pub fn lofi_map<P: AsRef<Path>>(file: P, label: bool) -> Result<LofiDevice> {
     let fd = LofiFd::open(false)?;
 
     let mut li: LofiIoctl = unsafe { std::mem::zeroed() };
@@ -247,6 +246,7 @@ pub fn lofi_map<P: AsRef<Path>>(file: P, label: bool)
 
     let lofi = LofiDevice::from_ioctl(&li);
 
+    make_devlinks();
     if let Some(devpath) = lofi.devpath.as_ref() {
         wait_for_device(devpath)?;
     }
@@ -276,8 +276,14 @@ fn major_to_driver(major: u32) -> Result<String> {
     let mut driver: [u8; MODMAXNAMELEN] = unsafe { std::mem::zeroed() };
 
     let major: usize = major as usize;
-    let r = unsafe { modctl(MODGETNAME, driver.as_mut_ptr() as usize,
-        driver.len(), &major as *const _ as usize) };
+    let r = unsafe {
+        modctl(
+            MODGETNAME,
+            driver.as_mut_ptr() as usize,
+            driver.len(),
+            &major as *const _ as usize,
+        )
+    };
     if r != 0 {
         let err = std::io::Error::last_os_error();
         bail!("could not determine major number: {}", err);
@@ -294,18 +300,24 @@ fn major_to_driver(major: u32) -> Result<String> {
     }
 }
 
+fn make_devlinks() {
+    let driver = std::ffi::CStr::from_bytes_with_nul(b"lofi\0").unwrap();
+
+    /*
+     * Attempt to force device link creation.  This might not work if we don't
+     * have sufficient privileges.  We don't actually need to use the library,
+     * so just open it and close it if that was successful.
+     */
+    let mut hdl = unsafe { di_devlink_init(driver.as_ptr(), DI_MAKE_LINK) };
+    if !hdl.is_null() {
+        unsafe { di_devlink_fini(&mut hdl) };
+    }
+}
+
 fn wait_for_device<P: AsRef<Path>>(dev: P) -> Result<()> {
     let p = CString::new(dev.as_ref().as_os_str().as_bytes()).unwrap();
 
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-
-    /*
-     * XXX It looks like we should be trying something like...
-     *
-     *  di_devlink_init("lofi", DI_MAKE_LINK)
-     *
-     * ... here.  Really, liblofiadm should take care of these details.
-     */
 
     for _ in 0..=30 {
         if unsafe { libc::stat(p.as_ptr(), &mut st) } == 0 {
@@ -333,7 +345,7 @@ fn device_to_minor<P: AsRef<Path>>(dev: P) -> Result<u32> {
     let driver = major_to_driver(major)?;
 
     if &driver != "lofi" {
-        bail!("driver was {}, not lofi");
+        bail!("driver was {driver}, not lofi");
     }
 
     Ok(minor >> LOFI_CMLB_SHIFT)
@@ -347,7 +359,8 @@ pub fn lofi_unmap_device<P: AsRef<Path>>(devpath: P) -> Result<()> {
     let mut li: LofiIoctl = unsafe { std::mem::zeroed() };
     li.li_id = minor;
 
-    fd.ioctl(LOFI_UNMAP_FILE_MINOR, &mut li).context("LOFI_UNMAP_FILE_MINOR")?;
+    fd.ioctl(LOFI_UNMAP_FILE_MINOR, &mut li)
+        .context("LOFI_UNMAP_FILE_MINOR")?;
 
     Ok(())
 }
